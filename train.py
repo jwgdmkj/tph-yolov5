@@ -3,8 +3,13 @@
 Train a YOLOv5 model on a custom dataset
 
 Usage:
-    $ python path/to/train.py --data coco128.yaml --weights yolov5s.pt --img 640
+    $ python path/to/train.py --data coco128.yaml --weights /models/yolov5x.pt --img 640
+
+    $ python3 train.py --img 250 --adam --batch 4 --epochs 80 --data ./data/VisDrone.yaml --weights ./models/yolov5l.pt --hy ./data/hyps/hyp.VisDrone.yaml --cfg ./models/yolov5l-tph-plus.yaml --name v5l-tph-plus
 """
+
+# copy & paste를 얘네가 진행했는지 체크
+# c&p를 하면 loss도 변경해야 함. 특히 BGEwithLogitLoss
 
 import argparse
 import logging
@@ -57,7 +62,7 @@ LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable
 RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
 
-
+# /media/mmlab/hdd/dataset/drone_veiw_dataset/VisDrone2019-DET-train/VisDrone2019-DET-train/images
 def train(hyp,  # path/to/hyp.yaml or hyp dictionary
           opt,
           device,
@@ -102,7 +107,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     cuda = device.type != 'cpu'
     init_seeds(1 + RANK)
     with torch_distributed_zero_first(LOCAL_RANK):
-        data_dict = data_dict or check_dataset(data)  # check if None
+        data_dict = data_dict or check_dataset(data)  # check if None, default : data/coco128.yaml (opt.data)
     train_path, val_path = data_dict['train'], data_dict['val']
     nc = 1 if single_cls else int(data_dict['nc'])  # number of classes
     names = ['item'] if single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
@@ -112,11 +117,51 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     # Model
     check_suffix(weights, '.pt')  # check weights
     pretrained = weights.endswith('.pt')
+
+    # if pre-trained모델이 존재 시,
     if pretrained:
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location=device)  # load checkpoint
+
+        # img는 ckpt['model'].yaml을 통과함.
+        # https://ropiens.tistory.com/44 참조
+        # nc : number of class. 감별해야 하는 클래스 수
+        # depth_multiple : 클수록 BottleneckCSP를 반복시켜 모델을 깊게.
+        # width_multiple : 클수록 해당 레이어의 conv 필터수 증가
+        # backbone : 특징 추출. Conv - 3*C3 - Conv - 6*C3 - Conv - 9*C3 - Conv - 3*Trans - SPP
+        # 1) Conv : [출력채널 수, 커널 크기, 스트라이드, 패딩]
+        # 2) C3 : CSPDarknet53. [출력채널 수, 잔여블록 수]
+        # 3) SPP :
+        # head : prediction 작업 담당
+        # ch : 입력영상 채널 수
+        """
+        {'nc': 10, 
+        'depth_multiple': 1.0, 
+        'width_multiple': 1.0, 
+        'anchors': 4, 
+        'backbone': [[-1, 1, 'Conv', [64, 6, 2, 2]], [-1, 1, 'Conv', [128, 3, 2]], [-1, 3, 'C3', [128]], 
+                    [-1, 1, 'Conv', [256, 3, 2]], [-1, 6, 'C3', [256]], [-1, 1, 'Conv', [512, 3, 2]], 
+                    [-1, 9, 'C3', [512]], [-1, 1, 'Conv', [1024, 3, 2]], [-1, 1, 'SPP', [1024, [5, 9, 13]]], 
+                    [-1, 3, 'C3TR', [1024]]], 
+        'head': [[-1, 1, 'Conv', [512, 1, 1]], [-1, 1, 'nn.Upsample', ['None', 2, 'nearest']], 
+                [[-1, 6], 1, 'Concat', [1]], [-1, 3, 'C3', [512, False]], [-1, 1, 'Conv', [256, 1, 1]], 
+                [-1, 1, 'nn.Upsample', ['None', 2, 'nearest']], [[-1, 4], 1, 'Concat', [1]], 
+                [-1, 3, 'C3', [256, False]], [-1, 1, 'Conv', [128, 1, 1]], [-1, 1, 'nn.Upsample', 
+                ['None', 2, 'nearest']], [[-1, 2], 1, 'Concat', [1]], [-1, 1, 'SPP', [128, [5, 9, 13]]], 
+                [-1, 3, 'C3', [128, False]], [-1, 1, 'CBAM', [128]], [-1, 1, 'Conv', [128, 3, 2]], 
+                [[-1, 18, 4], 1, 'Concat', [1]], [-1, 1, 'SPP', [256, [5, 9, 13]]], [-1, 3, 'C3', [256, False]], 
+                [-1, 1, 'CBAM', [256]], [-1, 1, 'Conv', [256, 3, 2]], [[-1, 14, 6], 1, 'Concat', [1]], 
+                [-1, 1, 'SPP', [512, [3, 7, 11]]], [-1, 3, 'C3', [512, False]], [-1, 1, 'CBAM', [512]], 
+                [-1, 1, 'Conv', [512, 3, 2]], [[-1, 10], 1, 'Concat', [1]], [-1, 1, 'SPP', [1024, [3, 7, 11]]], 
+                [-1, 3, 'C3TR', [1024, False]], [-1, 1, 'CBAM', [1024]], 
+                [[23, 28, 33, 38], 1, 'Detect', ['nc', 'anchors']]], 
+        'ch': 3}
+        """
         model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        # import pdb
+        # pdb.set_trace()
+
         exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
         csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
         csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
@@ -274,6 +319,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 f'Using {train_loader.num_workers} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
                 f'Starting training for {epochs} epochs...')
+
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
 
@@ -295,15 +341,23 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         if RANK in [-1, 0]:
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
+
+
+        # Batch
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
 
-            # Warmup
+            # Warmup - 훈련 초기에 poor local minima에 빠지는 것 방지
             if ni <= nw:
                 xi = [0, nw]  # x interp
                 # compute_loss.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
+
+                # gradient의 accumulation factor을 조정. 이는 update를 smooth하게 함.
                 accumulate = max(1, np.interp(ni, xi, [1, nbs / batch_size]).round())
+                # for : 파라미터 그룹을 반복. 각 파라미터 그룹은 학습 속도와 모멘텀이 다를 수도 있음.
+                # 그 동안, 파라미터 그룹에 대한 학습속도 조정 및 보간.
+                # 파라미터 그룹의 momentum을 lr과 비슷한 방식으로 조정
                 for j, x in enumerate(optimizer.param_groups):
                     # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
                     x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
@@ -311,6 +365,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                         x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
 
             # Multi-scale
+            # 입력 이미지를 grid크기의 배수로 임의로 조정.
             if opt.multi_scale:
                 sz = random.randrange(imgsz * 0.5, imgsz * 1.5 + gs) // gs * gs  # size
                 sf = sz / max(imgs.shape[2:])  # scale factor
@@ -320,8 +375,12 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
             # Forward
             with amp.autocast(enabled=cuda):
+                # import pdb
+                # pdb.set_trace()
                 pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+
+                # loss : sum, items : cat
+                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size.
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -444,9 +503,12 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
 def parse_opt(known=False):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', type=str, default=ROOT / 'yolov5s.pt', help='initial weights path')
-    parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
-    parser.add_argument('--data', type=str, default=ROOT / 'data/coco128.yaml', help='dataset.yaml path')
+    # parser.add_argument('--weights', type=str, default=ROOT / './weights/yolov5l-xs-1.pt', help='initial weights path')
+    # parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
+    parser.add_argument('--weights', type=str, default='', help='initial weights path')
+    parser.add_argument('--cfg', type=str, default=ROOT / './models/yolov5-VisDrone.yaml', help='model.yaml path')
+
+    parser.add_argument('--data', type=str, default=ROOT / 'data/VisDrone.yaml', help='dataset.yaml path')
     parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/hyp.scratch.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs, -1 for autobatch')
@@ -554,7 +616,7 @@ def main(opt, callbacks=Callbacks()):
                 'degrees': (1, 0.0, 45.0),  # image rotation (+/- deg)
                 'translate': (1, 0.0, 0.9),  # image translation (+/- fraction)
                 'scale': (1, 0.0, 0.9),  # image scale (+/- gain)
-                'shear': (1, 0.0, 10.0),  # image shear (+/- deg)
+                'shear': (1, 0.0, 10.0),  # image shear (+/- deg), 사각형 이미지를 마름모로
                 'perspective': (0, 0.0, 0.001),  # image perspective (+/- fraction), range 0-0.001
                 'flipud': (1, 0.0, 1.0),  # image flip up-down (probability)
                 'fliplr': (0, 0.0, 1.0),  # image flip left-right (probability)
