@@ -9,6 +9,35 @@ import torch.nn as nn
 from utils.metrics import bbox_iou
 from utils.torch_utils import is_parallel
 
+''' Generalized Focal Loss test '''
+class GeneralizedFocalLoss(nn.Module):
+    def __init__(self, loss_fcn, gamma=2.0, alpha=0.25, beta=2.0):
+        super().__init__()
+        self.loss_fcn = loss_fcn  # must be nn.BCEWithLogitsLoss()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.beta = beta
+        self.reduction = loss_fcn.reduction
+        self.loss_fcn.reduction = 'none'  # required to apply FL to each element
+
+    def forward(self, pred, true):
+        loss = self.loss_fcn(pred, true)
+
+        pred_prob = torch.sigmoid(pred)  # prob from logits
+        p_t = true * pred_prob + (1 - true) * (1 - pred_prob)
+        alpha_factor = true * self.alpha + (1 - true) * (1 - self.alpha)
+        modulating_factor = (1.0 - p_t) ** self.gamma
+        hinge_weight = (1 - pred_prob).pow(self.beta)
+        loss *= alpha_factor * modulating_factor * hinge_weight
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:  # 'none'
+            return loss
+''' GFL test End '''
+
 
 def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441
     # return positive, negative label smoothing BCE targets
@@ -118,6 +147,7 @@ class ComputeLoss:
         h = model.hyp  # hyperparameters
 
         # Define criteria
+        # sigmoid + BCELoss(Binary Corss Entropy)
         BCEcls = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['cls_pw']], device=device))
         BCEobj = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['obj_pw']], device=device))
 
@@ -137,12 +167,22 @@ class ComputeLoss:
             setattr(self, k, getattr(det, k))
 
     def __call__(self, p, targets):  # predictions, targets, model
+        '''
+        :param p: prediction
+        :param targets: GT
+        :return: sum of three type loss
+
+        loss : l_(n,c) =−w_(n,c) [p_c * y_(n,c) * log[σ(x_(n,c))] + (1− y_(n,c))⋅log[1−σ(x_(n,c))]]
+        1) BCEobj : object가 있는지 없는지 여부(즉, background인지 여부)
+        2) BCEcls : 어떤 class인지 여부
+        '''
         device = targets.device
-        lcls, lbox, lobj = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
+
+        lcls, lbox, lobj = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)  # 1사이즈 0텐서 생성
         tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
 
         # Losses
-        for i, pi in enumerate(p):  # layer index, layer predictions
+        for i, pi in enumerate(p):  # layer index, layer predictions / prediction 수 만큼, 즉 하나의 prediction(pi)에 대해
             b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
             tobj = torch.zeros_like(pi[..., 0], device=device)  # target obj
 
@@ -190,10 +230,35 @@ class ComputeLoss:
         return (lbox + lobj + lcls) * bs, torch.cat((lbox, lobj, lcls)).detach()
 
     def build_targets(self, p, targets):
+        '''
+        :param p: prediction
+        :param targets: GT, [배치의 이미지 인덱스, 클래스 레이블, x/y좌표, 너비/높이]
+        :return: tcls, tbox, indices, anchor
+
+        어떤 셀의 앵커박스가 해당 객체에 대한 responsible이 존재 하는지 알아야 함.
+        label 정보를 네트워크 출력에 맞게 재구성.
+
+        process
+        1) initialization : 변수, 텐서 쵝화
+        2) Target repeatition : 앵커박스마다 target이 반복됨. img의 각 개체가 앵커상자중 어느 것이든 탐지될 수 있기에
+        3) Anchor matching : feature mapdml 각 scale에 대해 각 대상 객체에 가장 적합한 앵커박스 계산 후, target과 가장 잘 일치하는
+                             anchor box를 가진 target만 포함하도록 필터링 됨.
+        4) Offset calculation : target BB에 대한 offset 계산
+        5) Target preparation : loss fucn 위한 final target 준비. class label과 BB, anchor box dim, indices of target 포함
+
+        variance
+        na, nt : Number of Anchors/Target(즉, 이미지 batch에 있는 target object의 수)
+        tcls, tbox, indices, anch : target class, target box, target indices, anchor box dimension
+        ai : 2차원 [[img 내의 target object 수] * anchor 수]. 즉, target 하나당 anchor 수만큼 존재.
+        targets : 1차원으로 1배수, 2차원으로 1배수, 3차원으로 앵커수만큼 targets을 확장 + ai를 마지막 차원 추가 후 cat
+                --> targets는 각 GT를 예측하는 앵커박스에 대한 정보가 포함됨.
+        '''
+
         # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
-        na, nt = self.na, targets.shape[0]  # number of anchors, targets
+        na, nt = self.na, targets.shape[0]
         tcls, tbox, indices, anch = [], [], [], []
-        gain = torch.ones(7, device=targets.device)  # normalized to gridspace gain
+
+        gain = torch.ones(7, device=targets.device)  # normalized to gridspace gain (7사이즈 1로 된 텐서 생성)
         ai = torch.arange(na, device=targets.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
         targets = torch.cat((targets.repeat(na, 1, 1), ai[:, :, None]), 2)  # append anchor indices
 
@@ -237,9 +302,13 @@ class ComputeLoss:
 
             # Append
             a = t[:, 6].long()  # anchor indices
-            indices.append((b, a, gj.clamp_(0, gain[3] - 1), gi.clamp_(0, gain[2] - 1)))  # image, anchor, grid indices
+            # indices.append((b, a, gj.clamp_(0, gain[3] - 1), gi.clamp_(0, gain[2] - 1)))  # image, anchor, grid indices
+            indices.append((b, a, gj.clamp_(0, int(gain[3] - 1)).long(),
+                            gi.clamp_(0, int(gain[2] - 1)).long()))  # image, anchor, grid indices
+
             tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
             anch.append(anchors[a])  # anchors
             tcls.append(c)  # class
 
         return tcls, tbox, indices, anch
+

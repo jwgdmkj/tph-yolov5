@@ -4,8 +4,8 @@ Train a YOLOv5 model on a custom dataset
 
 Usage:
     $ python path/to/train.py --data coco128.yaml --weights /models/yolov5x.pt --img 640
-
     $ python3 train.py --img 250 --adam --batch 4 --epochs 80 --data ./data/VisDrone.yaml --weights ./models/yolov5l.pt --hy ./data/hyps/hyp.VisDrone.yaml --cfg ./models/yolov5l-tph-plus.yaml --name v5l-tph-plus
+    $ python3 train.py --img 640 --adam --batch 4 --epochs 80 --data ./data/VisDrone.yaml --weights ./models/yolov5l.pt --hy ./data/hyps/hyp.VisDrone.yaml --cfg ./models/yolov5l-xs-tph.yaml --name v5l-xs-tph
 """
 
 # copy & paste를 얘네가 진행했는지 체크
@@ -105,7 +105,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     # Config
     plots = not evolve  # create plots
     cuda = device.type != 'cpu'
-    init_seeds(1 + RANK)
+    # init_seeds(1 + RANK)
+    init_seeds(1234)
     with torch_distributed_zero_first(LOCAL_RANK):
         data_dict = data_dict or check_dataset(data)  # check if None, default : data/coco128.yaml (opt.data)
     train_path, val_path = data_dict['train'], data_dict['val']
@@ -135,29 +136,63 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         # 3) SPP :
         # head : prediction 작업 담당
         # ch : 입력영상 채널 수
-        """
+        '''
         {'nc': 10, 
         'depth_multiple': 1.0, 
         'width_multiple': 1.0, 
         'anchors': 4, 
-        'backbone': [[-1, 1, 'Conv', [64, 6, 2, 2]], [-1, 1, 'Conv', [128, 3, 2]], [-1, 3, 'C3', [128]], 
-                    [-1, 1, 'Conv', [256, 3, 2]], [-1, 6, 'C3', [256]], [-1, 1, 'Conv', [512, 3, 2]], 
-                    [-1, 9, 'C3', [512]], [-1, 1, 'Conv', [1024, 3, 2]], [-1, 1, 'SPP', [1024, [5, 9, 13]]], 
-                    [-1, 3, 'C3TR', [1024]]], 
-        'head': [[-1, 1, 'Conv', [512, 1, 1]], [-1, 1, 'nn.Upsample', ['None', 2, 'nearest']], 
-                [[-1, 6], 1, 'Concat', [1]], [-1, 3, 'C3', [512, False]], [-1, 1, 'Conv', [256, 1, 1]], 
-                [-1, 1, 'nn.Upsample', ['None', 2, 'nearest']], [[-1, 4], 1, 'Concat', [1]], 
-                [-1, 3, 'C3', [256, False]], [-1, 1, 'Conv', [128, 1, 1]], [-1, 1, 'nn.Upsample', 
-                ['None', 2, 'nearest']], [[-1, 2], 1, 'Concat', [1]], [-1, 1, 'SPP', [128, [5, 9, 13]]], 
-                [-1, 3, 'C3', [128, False]], [-1, 1, 'CBAM', [128]], [-1, 1, 'Conv', [128, 3, 2]], 
-                [[-1, 18, 4], 1, 'Concat', [1]], [-1, 1, 'SPP', [256, [5, 9, 13]]], [-1, 3, 'C3', [256, False]], 
-                [-1, 1, 'CBAM', [256]], [-1, 1, 'Conv', [256, 3, 2]], [[-1, 14, 6], 1, 'Concat', [1]], 
-                [-1, 1, 'SPP', [512, [3, 7, 11]]], [-1, 3, 'C3', [512, False]], [-1, 1, 'CBAM', [512]], 
-                [-1, 1, 'Conv', [512, 3, 2]], [[-1, 10], 1, 'Concat', [1]], [-1, 1, 'SPP', [1024, [3, 7, 11]]], 
-                [-1, 3, 'C3TR', [1024, False]], [-1, 1, 'CBAM', [1024]], 
-                [[23, 28, 33, 38], 1, 'Detect', ['nc', 'anchors']]], 
+        'backbone': [[-1, 1, 'Conv', [64, 6, 2, 2]], 
+                     [-1, 1, 'Conv', [128, 3, 2]], 
+                     [-1, 3, 'C3', [128]], 
+                     
+                     [-1, 1, 'Conv', [256, 3, 2]], 
+                     [-1, 6, 'C3', [256]], 
+                     
+                     [-1, 1, 'Conv', [512, 3, 2]], 
+                     [-1, 9, 'C3', [512]], 
+                     
+                     [-1, 1, 'Conv', [1024, 3, 2]], 
+                     [-1, 1, 'SPP', [1024, [5, 9, 13]]], 
+                     [-1, 3, 'C3TR', [1024]]], 
+                     
+        'head' : [[-1, 1, 'Conv', [512, 1, 1]], 
+                  [-1, 1, 'nn.Upsample', ['None', 2, 'nearest']], 
+                  [[-1, 6], 1, 'Concat', [1]], 
+                  [-1, 3, 'C3', [512, False]], 
+                  
+                  [-1, 1, 'Conv', [256, 1, 1]], 
+                  [-1, 1, 'nn.Upsample', ['None', 2, 'nearest']], 
+                  [[-1, 4], 1, 'Concat', [1]], 
+                  [-1, 3, 'C3', [256, False]], 
+                  
+                  [-1, 1, 'Conv', [128, 1, 1]], 
+                  [-1, 1, 'nn.Upsample', ['None', 2, 'nearest']], 
+                  [[-1, 2], 1, 'Concat', [1]], 
+                  [-1, 1, 'SPP', [128, [5, 9, 13]]], 
+                  [-1, 3, 'C3', [128, False]], 
+                  [-1, 1, 'CBAM', [128]], 
+                  
+                  [-1, 1, 'Conv', [128, 3, 2]], 
+                  [[-1, 18, 4], 1, 'Concat', [1]], 
+                  [-1, 1, 'SPP', [256, [5, 9, 13]]], 
+                  [-1, 3, 'C3', [256, False]], 
+                  [-1, 1, 'CBAM', [256]], 
+                  
+                  [-1, 1, 'Conv', [256, 3, 2]], 
+                  [[-1, 14, 6], 1, 'Concat', [1]], 
+                  [-1, 1, 'SPP', [512, [3, 7, 11]]], 
+                  [-1, 3, 'C3', [512, False]], 
+                  [-1, 1, 'CBAM', [512]], 
+                  
+                  [-1, 1, 'Conv', [512, 3, 2]], 
+                  [[-1, 10], 1, 'Concat', [1]], 
+                  [-1, 1, 'SPP', [1024, [3, 7, 11]]], 
+                  [-1, 3, 'C3TR', [1024, False]], 
+                  [-1, 1, 'CBAM', [1024]], 
+                  
+                  [[23, 28, 33, 38], 1, 'Detect', ['nc', 'anchors']]], # 23, 28, 33, 38번째 layer의 output으로 detect
         'ch': 3}
-        """
+        '''
         model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
         # import pdb
         # pdb.set_trace()
@@ -263,11 +298,18 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                                               prefix=colorstr('train: '))
     mlc = int(np.concatenate(dataset.labels, 0)[:, 0].max())  # max label class
     nb = len(train_loader)  # number of batches
+    print('train loader len : ', nb)
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
 
     # Process 0
     if RANK in [-1, 0]:
         val_loader = create_dataloader(val_path, imgsz, batch_size // WORLD_SIZE * 2, gs, single_cls,
+                                       hyp=hyp, cache=None if noval else opt.cache, rect=True, rank=-1,
+                                       workers=workers, pad=0.5,
+                                       prefix=colorstr('val: '))[0]
+
+        test_path = data_dict['test']
+        test_loader = create_dataloader(test_path, imgsz, batch_size // WORLD_SIZE * 2, gs, single_cls,
                                        hyp=hyp, cache=None if noval else opt.cache, rect=True, rank=-1,
                                        workers=workers, pad=0.5,
                                        prefix=colorstr('val: '))[0]
@@ -280,7 +322,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             if plots:
                 plot_labels(labels, names, save_dir)
 
-            # Anchors
+            # Anchors --> train시 자동 실행될 수도....
             if not opt.noautoanchor:
                 check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
             model.half().float()  # pre-reduce anchor precision
@@ -342,7 +384,11 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
 
-
+        '''
+        1) datasets.py --> class InfiniteDataLoader --> def __iter__ --> __len__ 
+        2) datasets.py --> class LoadImagesAndLables --> __len__
+        3) 1) again
+        '''
         # Batch
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
@@ -473,6 +519,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     # end training -----------------------------------------------------------------------------------------------------
     if RANK in [-1, 0]:
         LOGGER.info(f'\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.')
+        print('------------- val set validation ------------------')
         for f in last, best:
             if f.exists():
                 strip_optimizer(f)  # strip optimizers
@@ -497,19 +544,49 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         callbacks.run('on_train_end', last, best, plots, epoch, results)
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}")
 
+
+    # ---------------------------- test에 대해 실행 Start ----------------------- #
+    if RANK in [-1, 0]:
+        LOGGER.info(f'\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.')
+        print('------------- test set validation ------------------')
+        for f in last, best:
+            if f.exists():
+                strip_optimizer(f)  # strip optimizers
+                if f is best:
+                    LOGGER.info(f'\nValidating {f}...')
+                    results, _, _ = val.run(data_dict,
+                                            batch_size=batch_size // WORLD_SIZE * 2,
+                                            imgsz=imgsz,
+                                            model=attempt_load(f, device).half(),
+                                            iou_thres=0.65 if is_coco else 0.60,  # best pycocotools results at 0.65
+                                            single_cls=single_cls,
+                                            dataloader=test_loader,
+                                            save_dir=save_dir,
+                                            save_json=is_coco,
+                                            verbose=True,
+                                            plots=True,
+                                            callbacks=callbacks,
+                                            compute_loss=compute_loss)  # val best model with plots
+                    if is_coco:
+                        callbacks.run('on_fit_epoch_end', list(mloss) + list(results) + lr, epoch, best_fitness, fi)
+
+        callbacks.run('on_train_end', last, best, plots, epoch, results)
+        LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}")
+    # ---------------------------- test에 대해 실행 End ----------------------- #
+
     torch.cuda.empty_cache()
     return results
 
 
 def parse_opt(known=False):
     parser = argparse.ArgumentParser()
-    # parser.add_argument('--weights', type=str, default=ROOT / './weights/yolov5l-xs-1.pt', help='initial weights path')
+    parser.add_argument('--weights', type=str, default=ROOT / './weights/yolov5l-xs-1.pt', help='initial weights path')
+    # parser.add_argument('--weights', type=str, default='', help='initial weights path')
     # parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
-    parser.add_argument('--weights', type=str, default='', help='initial weights path')
     parser.add_argument('--cfg', type=str, default=ROOT / './models/yolov5-VisDrone.yaml', help='model.yaml path')
 
-    parser.add_argument('--data', type=str, default=ROOT / 'data/VisDrone.yaml', help='dataset.yaml path')
-    parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/hyp.scratch.yaml', help='hyperparameters path')
+    parser.add_argument('--data', type=str, default=ROOT / './data/VisDrone.yaml', help='dataset.yaml path')
+    parser.add_argument('--hyp', type=str, default=ROOT / './data/hyps/hyp.scratch.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs, -1 for autobatch')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='train, val image size (pixels)')
@@ -650,8 +727,11 @@ def main(opt, callbacks=Callbacks()):
 
                 # Mutate
                 mp, s = 0.8, 0.2  # mutation probability, sigma
+
                 npr = np.random
-                npr.seed(int(time.time()))
+                # npr.seed(int(time.time()))
+                npr.seed(1234)
+
                 g = np.array([meta[k][0] for k in hyp.keys()])  # gains 0-1
                 ng = len(meta)
                 v = np.ones(ng)

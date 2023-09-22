@@ -25,6 +25,10 @@ from utils.general import (colorstr, increment_path, make_divisible, non_max_sup
 from utils.plots import Annotator, colors
 from utils.torch_utils import time_sync
 
+from einops import rearrange, repeat
+from torch import einsum
+from einops.layers.torch import Rearrange
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -96,6 +100,7 @@ class CBAM(nn.Module):
         out = self.spatial_attention(out) * out
         return out
 
+# ------------------------------ ViT start ----------------------------#
 class TransformerLayer(nn.Module):
     def __init__(self, c, num_heads):
         super().__init__()
@@ -138,6 +143,8 @@ class TransformerBlock(nn.Module):
         p = x.flatten(2).unsqueeze(0).transpose(0, 3).squeeze(3)
         return self.tr(p + self.linear(p)).unsqueeze(3).transpose(0, 3).reshape(b, self.c2, w, h)
 
+# ------------------------------ ViT End ----------------------------#
+
 def drop_path_f(x, drop_prob: float = 0., training: bool = False):
     """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
 
@@ -168,6 +175,16 @@ class DropPath(nn.Module):
     def forward(self, x):
         return drop_path_f(x, self.drop_prob, self.training)
 
+# ------------------------------ Swin Start --------------------------------------- #
+'''
+if yolov5l-xs-tph, then window_size = 8 and input_size is...
+1) [B, 64, 160, 160]
+2) [B, 128, 80, 80]
+3) [B, 256, 40, 40]
+4) [B, 512, 20, 20]
+
+and C3(C)STR의 param은 앞단 C3에서의 hidden layer channel.
+'''
 def window_partition(x, window_size: int):
     """
     将feature map按照window_size划分成一个个没有重叠的window
@@ -428,8 +445,11 @@ class SwinTransformerBlock(nn.Module):
     def forward(self, x):
         if self.conv is not None:
             x = self.conv(x)
+
         x = self.tr(x)
         return x
+
+# ------------------------------ Swin Over --------------------------------------- #
 
 class Bottleneck(nn.Module):
     # Standard bottleneck
@@ -828,3 +848,1006 @@ class Classify(nn.Module):
     def forward(self, x):
         z = torch.cat([self.aap(y) for y in (x if isinstance(x, list) else [x])], 1)  # cat if list
         return self.flat(self.conv(z))  # flatten to x(b,c2)
+
+''' mine '''
+###################### CSwin Transformer #########################
+# https://github.com/microsoft/CSWin-Transformer/blob/main/models/cswin.py
+# MLP : Same with Swin
+
+def img2windows(img, H_sp, W_sp):
+    """
+    img: B C H W
+    """
+    B, C, H, W = img.shape
+    # print('img2windows 0) ', img.shape, H_sp, W_sp)
+    img_reshape = img.view(B, C, H // H_sp, H_sp, W // W_sp, W_sp)
+    # print('img2windows 1) ', img_reshape.shape, ' because Hsp and Wsp is ', H_sp, W_sp)
+    img_perm = img_reshape.permute(0, 2, 4, 3, 5, 1).contiguous()
+    # print('img2windows 2) ', img_reshape.shape)
+    img_perm = img_perm.reshape(-1, H_sp * W_sp, C)
+    # print('img2windows 3) ', img_perm.shape)
+    return img_perm
+
+def windows2img(img_splits_hw, H_sp, W_sp, H, W):
+    """
+    img_splits_hw: B' H W C
+    """
+    B = int(img_splits_hw.shape[0] / (H * W / H_sp / W_sp))
+
+    img = img_splits_hw.view(B, H // H_sp, W // W_sp, H_sp, W_sp, -1)
+    img = img.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    return img
+
+# Role : WindowAttentinon in SWin
+class LePEAttention(nn.Module):
+    def __init__(self, dim, #resolution,
+                 idx, split_size=7, dim_out=None, num_heads=8,
+                 attn_drop=0., proj_drop=0., qk_scale=None):
+        '''
+        original:
+        x.shape = [896, 32, 56, 1]
+        H = 56
+        W = 56
+        H_sp = 56 = self.resolution
+        W_sp = 1 = self.split_size
+        '''
+        super().__init__()
+        self.dim = dim
+        self.dim_out = dim_out or dim
+        # self.resolution = resolution
+        self.split_size = split_size
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.idx = idx
+        # if idx == -1:
+        #     H_sp, W_sp = self.resolution, self.resolution
+        # elif idx == 0:
+        #     H_sp, W_sp = self.resolution, self.split_size
+        # elif idx == 1:
+        #     W_sp, H_sp = self.resolution, self.split_size
+        # else:
+        #     print("ERROR MODE", idx)
+        #     exit(0)
+        # self.H_sp = H_sp
+        # self.W_sp = W_sp
+        stride = 1
+        self.get_v = nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1, groups=dim)
+
+        self.attn_drop = nn.Dropout(attn_drop)
+
+    def im2cswin(self, x, Hsp, Wsp, _H, _W):
+        '''
+        x.shape = [1, 64, 256] --> H, W = 8(sqrt(64))
+
+        '''
+        B, N, C = x.shape
+        H = _H
+        W = _W
+        # print('H, W : ', H, W)
+        x = x.transpose(-2, -1).contiguous()
+        # print('im2cswin 1 : ', x.shape)
+        x = x.view(B, C, H, W)
+        # print(x.shape, Hsp, Wsp)
+        # print('im2cswin 2 : ', x.shape)
+        x = img2windows(x, Hsp, Wsp)
+        # print('im2cswin 3 : ', x.shape, ' because HSP and WSP is ', Hsp, Wsp)
+        x = x.reshape(-1, Hsp * Wsp, self.num_heads, C // self.num_heads)
+        # print('im2cswin 4 : ', x.shape, ' because headnum and C is ', self.num_heads, C)
+        x = x.permute(0, 2, 1, 3).contiguous()
+        # print('im2cswin 5 : ', x.shape)
+        return x
+
+    def get_lepe(self, x, func, Hsp, Wsp, _H, _W):
+        B, N, C = x.shape
+        H = _H
+        W = _W
+        x = x.transpose(-2, -1).contiguous().view(B, C, H, W)
+
+        H_sp, W_sp = Hsp, Wsp
+        x = x.view(B, C, H // H_sp, H_sp, W // W_sp, W_sp)
+        x = x.permute(0, 2, 4, 1, 3, 5).contiguous().reshape(-1, C, H_sp, W_sp)  ### B', C, H', W'
+
+        lepe = func(x)  ### B', C, H', W'
+        lepe = lepe.reshape(-1, self.num_heads, C // self.num_heads, H_sp * W_sp).permute(0, 1, 3, 2).contiguous()
+
+        x = x.reshape(-1, self.num_heads, C // self.num_heads, Hsp * Wsp).permute(0, 1, 3, 2).contiguous()
+        return x, lepe
+
+    def forward(self, qkv, _H, _W):
+        """
+        x shape : [1, 64, 256] : B L C
+        HW : HxW
+        reso : sqrt(L)
+        """
+        if self.idx == -1:
+            H_sp, W_sp = _H, _W
+        elif self.idx == 0:
+            H_sp, W_sp = _H, self.split_size
+        elif self.idx == 1:
+            H_sp, W_sp = self.split_size, _W
+        else:
+            print("ERROR MODE", self.idx)
+            exit(0)
+
+        # print('-------------------------------- 4) LePE Attn -------------------------------------- ')
+        # print('qkv shape : ', qkv.shape)
+
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        ### Img2Window
+        B, L, C = q.shape
+        # assert L == H * W, "flatten img_tokens has wrong size"
+
+        # print('var H W q shape : ', _H, _W, q.shape)
+        # print('var Hsp Wsp : ', H_sp, W_sp)
+        q = self.im2cswin(q, H_sp, W_sp, _H, _W)
+        # print()
+        k = self.im2cswin(k, H_sp, W_sp, _H, _W)
+        # print('so, result of im2cswin : ', q.shape, k.shape)
+        v, lepe = self.get_lepe(v, self.get_v, H_sp, W_sp, _H, _W)
+        # print('so, result of get_lepe : ', v.shape, lepe.shape, ' becuase get_v is conv2 ', self.dim)
+
+        q = q * self.scale
+        attn = (q @ k.transpose(-2, -1))  # B head N C @ B head C N --> B head N N
+        attn = nn.functional.softmax(attn, dim=-1, dtype=attn.dtype)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v) + lepe
+        x = x.transpose(1, 2).reshape(-1, H_sp * W_sp, C)  # B head N N @ B head N C
+
+        ### Window2Img
+        x = windows2img(x, H_sp, W_sp, _H, _W).view(B, -1, C)  # B H' W' C
+
+        # print('lepe output shape ----- ', x.shape)
+        return x
+
+# same role with SwinTransformerLayer, original name is CSwinBlock
+class CSwinBlock(nn.Module):
+    '''
+    original reso : img_size // (2 ** (i+1)), so If reso == split_size == 7, it is last stage.
+    Here : input feature height(=width)
+    deleted variance : about reso(=patches_resolution)
+    '''
+    def __init__(self, dim, num_heads, # reso
+                 split_size=7, mlp_ratio=4., qkv_bias=False, qk_scale=None,
+                 drop=0., attn_drop=0., drop_path=0.,
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm,
+                 last_stage=False):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        # self.patches_resolution = reso
+        self.split_size = split_size
+        self.mlp_ratio = mlp_ratio
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.norm1 = norm_layer(dim)
+        print(self.norm1)
+
+        # self.patches_resolution, split_size = 112, 3 --> then, last_stage = False
+        # if self.patches_resolution == split_size:
+        #     last_stage = True
+        # if last_stage:
+        #     self.branch_num = 1
+        # else:
+        #     self.branch_num = 2
+        self.branch_num = 2
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(drop)
+
+        # if last_stage:
+        #     self.attns = nn.ModuleList([
+        #         LePEAttention(
+        #             dim, idx = -1, # resolution=self.patches_resolution,
+        #             split_size=split_size, num_heads=num_heads, dim_out=dim,
+        #             qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+        #         for i in range(self.branch_num)])
+        # else:
+        #     self.attns = nn.ModuleList([
+        #         LePEAttention(
+        #             dim // 2, dix = i, # resolution=self.patches_resolution
+        #             split_size=split_size, num_heads=num_heads // 2, dim_out=dim // 2,
+        #             # dim, resolution=self.patches_resolution, idx=i,
+        #             # split_size=split_size, num_heads=num_heads // 2, dim_out=dim,
+        #             qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+        #         for i in range(self.branch_num)])
+
+        self.attns = nn.ModuleList([
+            LePEAttention(
+                dim // 2, idx = i,  # resolution=self.patches_resolution
+                split_size=split_size, num_heads=num_heads // 2, dim_out=dim // 2,
+                # dim, resolution=self.patches_resolution, idx=i,
+                # split_size=split_size, num_heads=num_heads // 2, dim_out=dim,
+                qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+            for i in range(self.branch_num)])
+
+        mlp_hidden_dim = int(dim * mlp_ratio)
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, out_features=dim, act_layer=act_layer,
+                       drop=drop)
+        self.norm2 = norm_layer(dim)
+
+    def forward(self, x):
+        """
+        x: B, H*W, C
+        original : [16, 56 * 56, 64]
+        cur : [1, 512, 8, 8] --> [1, 64, 512]
+        """
+
+        # H = W = self.patches_resolution
+        # B, L, C = x.shape
+        # assert L == H * W, "flatten img_tokens has wrong size"
+
+        # input x.shape : 1, 512, 8, 8
+        # print('------------------------- 3) CSwinBlock ------------------------------- ')
+        # print('CSwin  input shape-------------', x.shape)
+
+        # padding (also in SwinT)
+        Padding = False
+        _, _, H_, W_ = x.shape
+        if min(H_, W_) < self.split_size or H_ % self.split_size!=0 or W_ % self.split_size!=0:
+            # print('padding condition : ', H_, W_, self.split_size)
+            Padding = True
+            # print(f'img_size {min(H_, W_)} is less than (or not divided by) split_size {self.split_size}, Padding.')
+            pad_r = (self.split_size - W_ % self.split_size) % self.split_size
+            pad_b = (self.split_size - H_ % self.split_size) % self.split_size
+            x = F.pad(x, (0, pad_r, 0, pad_b))
+        # print('X after padding : ', x.shape)
+        # padding over
+
+        B, C, H, W = x.shape
+
+        # 아래에서 2462줄 중 하나가 문제다. 무조건 output shape가 swint와 같도록 만들어라. swinT의 다음 인풋은역시 (1,512,8,8)이다.
+        # 즉, [1,64,512]를 바꿔라.
+        x = x.permute(0, 2, 3, 1).contiguous().view(B, -1, C)  # b, L, c
+        # print('after permute(0,2,3,1) and view(BLC) ', x.shape)
+
+        img = self.norm1(x)
+        # print('after norm : ', x.shape)
+        qkv = self.qkv(img).reshape(B, -1, 3, C).permute(2, 0, 1, 3)    # 3, 1, 64, 512
+        # print('qkv shape : ', qkv.shape)
+
+        # branch로 나누는 이유 : 앞 절반은 horizontal, 뒤 절반은 vertical
+        if self.branch_num == 2:
+            x1 = self.attns[0](qkv[:, :, :, :C // 2], H, W)
+            x2 = self.attns[1](qkv[:, :, :, C // 2:], H, W)
+            attened_x = torch.cat([x1, x2], dim=2)
+        else:
+            attened_x = self.attns[0](qkv)
+        attened_x = self.proj(attened_x)
+        x = x + self.drop_path(attened_x)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+
+        # ----------------------------------- original CSwinT is over -------------------------------- #
+
+        # change shape into 4 size, [batch, embed, height, width]
+        x = x.permute(0, 2, 1).contiguous()
+        # print('x shape after permute : ', x.shape)
+        x = x.view(-1, C, H, W)  # b c h w
+
+        # reverse padding
+        if Padding:
+            x = x[:, :, :H_, :W_]
+        # print('cswin output shape : ', x.shape)
+        # x = torch.mean(x, dim=1)    # added in 7/11 to match the dimension
+        return x
+
+# CSwin Transformer
+# adapted only stage1
+class CSwinTransformerBlock(nn.Module):
+    '''
+    num_heads == dim // 32 = 2/4/8/16
+    yolov5l-tph-plus.yaml
+        1) [B, 512, 20, 20]
+    yolov5l-xs-tph:
+        1) [B, 64, 160, 160]
+        2) [B, 128, 80, 80]
+        3) [B, 256, 40, 40]
+        4) [B, 512, 20, 20]
+    img_size는 forward에서 받게 한다.
+    '''
+    def __init__(self, c1, c2, num_heads, num_layers=1, img_size=20, split_size = [4,4,4,4]):
+        super().__init__()
+        self.conv = None
+        if c1 != c2:
+            self.conv = Conv(c1, c2)
+
+        # print('CSwin init c1, c2, headnum, layernum, splitsize : ', c1, c2, num_heads, num_layers, split_size[0])
+
+        # remove input_resolution
+        self.blocks = nn.Sequential(*[CSwinBlock(dim=c2, num_heads=num_heads, # reso = img_size,
+                                                      split_size = split_size[i]) for i in range(num_layers)])
+
+    def forward(self, x):
+        # print('---------------------- 1 + 2) CSWin + BasicLayer ------------------------ ')
+        # print('SwinT input : ', x.shape)
+        if self.conv is not None:
+            x = self.conv(x)
+
+        # print('SwinT after conv : ', x.shape)
+        reso = x.shape[2]   # resolution
+        x = self.blocks(x)
+        # print('CSwinT output: ', x.shape)
+        # print('----------------------------------------')
+        return x
+
+class C3CSTR(C3):
+    # C3 module with CSwinTransformerBlock()
+    # c_//32 = 16
+    def __init__(self, c1, c2, num_layers=1, shortcut=True, g=1, e=0.5):
+        # pdb.set_trace()
+        super().__init__(c1, c2, num_layers, shortcut, g, e)
+        c_ = int(c2 * e)    # 512
+        self.m = CSwinTransformerBlock(c_, c_, c_//32, num_layers)
+
+# class SWTCSPB(nn.Module):
+#     # CSP Bottleneck https://github.com/WongKinYiu/CrossStagePartialNetworks
+#     def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+#         super(STCSPB, self).__init__()
+#         c_ = int(c2)  # hidden channels
+#         self.cv1 = Conv(c1, c_, 1, 1)
+#         self.cv2 = Conv(c_, c_, 1, 1)
+#         self.cv3 = Conv(2 * c_, c2, 1, 1)
+#         num_heads = c_ // 32
+#         self.m = CSwinTransformerBlock(c_, c_, num_heads, n)
+#         #self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+#
+#     def forward(self, x):
+#         x1 = self.cv1(x)
+#         y1 = self.m(x1)
+#         y2 = self.cv2(x1)
+#         return self.cv3(torch.cat((y1, y2), dim=1))
+#     pass
+
+###################### CSwin Transformer End ######################
+
+###################### HALO Net ############################
+
+# relative positional embedding
+def to(x):
+    return {'device': x.device, 'dtype': x.dtype}
+
+def pair(x):
+    return (x, x) if not isinstance(x, tuple) else x
+
+def expand_dim(t, dim, k):
+    t = t.unsqueeze(dim = dim)
+    expand_shape = [-1] * len(t.shape)
+    expand_shape[dim] = k
+    return t.expand(*expand_shape)
+
+def rel_to_abs(x):
+    b, l, m = x.shape
+    r = (m + 1) // 2
+
+    col_pad = torch.zeros((b, l, 1), **to(x))
+    x = torch.cat((x, col_pad), dim = 2)
+    flat_x = rearrange(x, 'b l c -> b (l c)')
+    flat_pad = torch.zeros((b, m - l), **to(x))
+    flat_x_padded = torch.cat((flat_x, flat_pad), dim = 1)
+    final_x = flat_x_padded.reshape(b, l + 1, m)
+    final_x = final_x[:, :l, -r:]
+    return final_x
+
+def relative_logits_1d(q, rel_k):
+    b, h, w, _ = q.shape
+    r = (rel_k.shape[0] + 1) // 2
+
+    logits = einsum('b x y d, r d -> b x y r', q, rel_k)
+    logits = rearrange(logits, 'b x y r -> (b x) y r')
+    logits = rel_to_abs(logits)
+
+    logits = logits.reshape(b, h, w, r)
+    logits = expand_dim(logits, dim = 2, k = r)
+    return logits
+
+class RelPosEmb(nn.Module):
+    def __init__(
+        self,
+        block_size,
+        rel_size,
+        dim_head
+    ):
+        super().__init__()
+        height = width = rel_size
+        scale = dim_head ** -0.5
+
+        self.block_size = block_size
+        self.rel_height = nn.Parameter(torch.randn(height * 2 - 1, dim_head) * scale)
+        self.rel_width = nn.Parameter(torch.randn(width * 2 - 1, dim_head) * scale)
+
+    def forward(self, q):
+        block = self.block_size
+
+        q = rearrange(q, 'b (x y) c -> b x y c', x = block)
+        rel_logits_w = relative_logits_1d(q, self.rel_width)
+        rel_logits_w = rearrange(rel_logits_w, 'b x i y j-> b (x y) (i j)')
+
+        q = rearrange(q, 'b x y d -> b y x d')
+        rel_logits_h = relative_logits_1d(q, self.rel_height)
+        rel_logits_h = rearrange(rel_logits_h, 'b x i y j -> b (y x) (j i)')
+        return rel_logits_w + rel_logits_h
+
+# classes
+
+class HaloAttention(nn.Module):
+    '''
+    original : __init__(self, *, dim, block_size, halo_size, dim_head=64, heads=8)
+    c2 == dim
+    num_heads == heads = c2//32(512일 때 16)
+    block_size / halo_size : 8 / 4
+    '''
+    def __init__(self, c1, c2, num_heads, block_size, halo_size):
+        super().__init__()
+        assert halo_size > 0, 'halo size must be greater than 0'
+
+        self.conv = None
+        if c1 != c2:
+            self.conv = Conv(c1, c2)
+
+        self.heads = num_heads
+        self.dim = c2
+        dim_head = c2 // num_heads
+        self.scale = dim_head ** -0.5
+
+        self.block_size = block_size
+        self.halo_size = halo_size
+
+        inner_dim = dim_head * num_heads
+        print('inner_dim ', inner_dim)
+
+        self.rel_pos_emb = RelPosEmb(
+            block_size = block_size,
+            rel_size = block_size + (halo_size * 2),
+            dim_head = dim_head
+        )
+
+        self.to_q  = nn.Linear(c2, inner_dim, bias = False)
+        self.to_kv = nn.Linear(c2, inner_dim * 2, bias = False)
+        self.to_out = nn.Linear(inner_dim, c2)
+
+    def forward(self, x):
+        '''
+        yolov5l-tph-plus.yaml
+            1) [B, 512, 20, 20] - train
+            2) [B, 512, 12, 21] - val
+        yolov5l-xs-tph:
+            1) [B, 64, 160, 160] - train
+            2) [B, 128, 80, 80]
+            3) [B, 256, 40, 40]
+            4) [B, 512, 20, 20]
+        --> 모든 block/halo를 4/2로 통일, 이후에 차원 별로 각각 8/4, 16/8, 32/16으로 늘려보는 건 어떤가?
+        '''
+        b_, c_, h_, w_, block, halo, heads, device = *x.shape, self.block_size, self.halo_size, self.heads, x.device
+
+        # padding (also in SwinT)
+        Padding = False
+        if min(h_, w_) < self.block_size or h_ % self.block_size != 0 or w_ % self.block_size != 0:
+            # print('padding condition : ', H_, W_, self.split_size)
+            Padding = True
+            # print(f'img_size {min(H_, W_)} is less than (or not divided by) split_size {self.split_size}, Padding.')
+            pad_r = (self.block_size - w_ % self.block_size) % self.block_size
+            pad_b = (self.block_size - h_ % self.block_size) % self.block_size
+            x = F.pad(x, (0, pad_r, 0, pad_b))
+        # print('X after padding : ', x.shape)
+        # padding over
+
+        b, c, h, w = x.shape
+
+        assert h % block == 0 and w % block == 0, 'fmap dimensions must be divisible by the block size'
+        assert c == self.dim, f'channels for input ({c}) does not equal to the correct dimension ({self.dim})'
+
+        # get block neighborhoods, and prepare a halo-ed version (blocks with padding) for deriving key values
+        # q_inp : [16, 64, 512] by block=8일 때, [32, 32]는 각각 4개씩 8x8로 나뉘어지니 [1x4x4, 8x8, 512]
+        # print('x shape ', x.shape)
+        q_inp = rearrange(x, 'b c (h p1) (w p2) -> (b h w) (p1 p2) c', p1 = block, p2 = block)
+        # print('q_inp shape, p1, p2 : ', q_inp.shape, block, block)
+
+        # x = [1, 512, 32, 32]일 떄, padding=4, stride=8, kernel=16이면
+        # 0~16/8~24/16~32/24~40으로 가로 4회, 세로 4회 진행됨.
+        # 또한, 이 16x16이 각각 512차원이므로, 총 [1, 512x256, 16] = [1, 131072, 16]가 됨.
+        # 이를, rearrange 통해 batch와 패치를 묶고, 패치당 256개 픽셀, 각 픽셀은 512차원 임베딩 -> [1x16, 256, 512]
+        kv_inp = F.unfold(x, kernel_size = block + halo * 2, stride = block, padding = halo)
+        # print('kv unfold shape ', kv_inp.shape, 'kernelsize ', block+halo*2, 'block halo ', block, halo)
+        kv_inp = rearrange(kv_inp, 'b (c j) i -> (b i) j c', c = c)
+        # print('kv rearr shape ', kv_inp.shape)
+
+        # derive queries, keys, values, here, inner_dim = 256
+        # so q = [16, 64, 256] / k, v = [16, 256, 256]
+        q = self.to_q(q_inp)
+        k, v = self.to_kv(kv_inp).chunk(2, dim = -1)
+        # print('q k v shape ', q.shape, k.shape, v.shape)
+
+        # split heads
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h = heads), (q, k, v))
+        # print('qkv after map ', q.shape, k.shape, v.shape)
+
+        # scale
+        q *= self.scale
+
+        # attention, [64, 64, 256]
+        sim = einsum('b i d, b j d -> b i j', q, k)
+        # print('qkt(=sim) shape ', sim.shape)
+
+        # add relative positional bias, still [64, 64, 256]
+        sim += self.rel_pos_emb(q)
+        # print('sim after pos_emb ', sim.shape)
+
+        # mask out padding (in the paper, they claim to not need masks, but what about padding?)
+
+        mask = torch.ones(1, 1, h, w, device = device)
+        mask = F.unfold(mask, kernel_size = block + (halo * 2), stride = block, padding = halo)
+        # print('mask unfold and block halo ', mask.shape, block, halo)
+        mask = repeat(mask, '() j i -> (b i h) () j', b = b, h = heads)
+        # print('mask repeat d heads ', mask.shape, b, heads)
+        # print(mask)
+        mask = mask.bool()
+        # print(mask)
+
+        # This line computes the maximum negative value representable by the data type of the sim tensor.
+        # This value is often used in attention mechanisms to mask out certain positions by setting their scores
+        # to a very negative value, ensuring they get a near-zero weight after applying the softmax function
+        max_neg_value = -torch.finfo(sim.dtype).max
+
+        # https://thought-process-ing.tistory.com/79
+        # sim의 바꾸고자 하는 값(mask)를 max_neg_value로 변경
+        sim.masked_fill_(mask, max_neg_value)
+
+        # attention
+        attn = sim.softmax(dim = -1)
+
+        # aggregate
+        out = einsum('b i j, b j d -> b i d', attn, v)
+        # print('out first shape ', out.shape)
+
+        # merge and combine heads
+        out = rearrange(out, '(b h) n d -> b n (h d)', h = heads)
+        out = self.to_out(out)
+        # print('out after rearr and to_out ', out.shape)
+
+        # merge blocks back to original feature map
+        out = rearrange(out, '(b h w) (p1 p2) c -> b c (h p1) (w p2)', b = b, h = (h // block), w = (w // block), p1 = block, p2 = block)
+
+        # reverse padding
+        if Padding:
+            out = out[:, :, :h_, :w_]
+        # print('final output ', out.shape)
+        return out
+
+class HaloAttentionBlock(nn.Module):
+    '''
+    num_heads == dim // 32 = 2/4/8/16
+    yolov5l-tph-plus.yaml
+        1) [B, 512, 20, 20]
+    yolov5l-xs-tph:
+        1) [B, 64, 160, 160]
+        2) [B, 128, 80, 80]
+        3) [B, 256, 40, 40]
+        4) [B, 512, 20, 20]
+    img_size는 forward에서 받게 한다.
+    '''
+    def __init__(self, c1, c2, num_heads, block_size, halo_size, num_layers):
+        super().__init__()
+        self.conv = None
+        if c1 != c2:
+            self.conv = Conv(c1, c2)
+
+        # print('CSwin init c1, c2, headnum, layernum, splitsize : ', c1, c2, num_heads, num_layers, split_size[0])
+
+        # remove input_resolution
+        self.blocks = nn.Sequential(*[HaloAttention(c1=c1, c2=c2, num_heads=num_heads, block_size=block_size,
+                                                    halo_size=halo_size) for i in range(num_layers)])
+
+    def forward(self, x):
+        # print('---------------------- 1 + 2) CSWin + BasicLayer ------------------------ ')
+        # print('SwinT input : ', x.shape)
+        if self.conv is not None:
+            x = self.conv(x)
+
+        # print('SwinT after conv : ', x.shape)
+        reso = x.shape[2]   # resolution
+        x = self.blocks(x)
+        # print('CSwinT output: ', x.shape)
+        # print('----------------------------------------')
+        return x
+
+class C3Halo(C3):
+    # C3 module with CSwinTransformerBlock()
+    # c_//32 = 16
+    def __init__(self, c1, c2, num_layers=1, shortcut=True, block_size=8, halo_size=4, g=1, e=0.5):
+        super().__init__(c1, c2, num_layers, shortcut, g, e)
+        c_ = int(c2 * e)    # 512
+        self.m = HaloAttentionBlock(c_, c_, c_//32, block_size, halo_size, num_layers)
+###################### HALO Net End #########################
+
+
+
+###################### My Own Transformer Start ####################
+class myAttention(nn.Module):
+    def __init__(self, dim, num_heads, window_size, norm_layer=nn.LayerNorm, bias=False,
+                 drop_path=0., mlp_ratio=4., act_layer=nn.GELU, drop=0.):
+        super().__init__()
+
+        # init parameter
+        self.dim = dim
+        self.num_heads = num_heads
+        self.window_size = window_size
+
+        # kernel size and scale
+        self.kernelX = (window_size, window_size * 3)
+        self.kernelY = (window_size * 3, window_size)
+
+        # head variance, head_dim split by 2 because x divided into x1 and x2
+        head_dim = (dim/2) // num_heads
+        self.scale = head_dim ** -0.5
+
+        # linear to make QKV
+        self.norm1 = norm_layer(dim)
+        self.qkv = nn.Linear(dim, dim*3, bias)
+        self.get_v = nn.Conv2d(dim//2, dim//2, kernel_size=3, stride=1, padding=1, groups=dim//2)
+
+        # Position Embedding
+        # self.rel_pos_emb = RelPosEmb(
+        #     block_size=window_size,
+        #     rel_size=window_size * 3,
+        #     dim_head=head_dim
+        # )
+
+        # Function after calculate QKV
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.proj = nn.Linear(dim, dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, out_features=dim, act_layer=act_layer,
+                       drop=drop)
+        self.norm2 = norm_layer(dim)
+
+    def get_lepe(self, x, func, flag):
+        '''
+        input : [Bhw, H/hw * W/ws, c]
+        input must be [B, C, H, W] at func
+        1) after transpose & contiguous : [Bhw c H/hw W/ws]
+        2) so, after func, x : [Bhw c H/hw W/ws]
+        3) lepe must be same size with qktv : [Bhw, H/ws * W/ws,
+
+        이를 chan을 head로 나누고 그 head를 배치로 넣어야 함. 또한 HW 한꺼번에 만들어야 함.
+        '''
+        # print('5) get_lepe input : ', x.shape)
+
+        B_, N_, C_ = x.shape
+
+        if flag == 'x_axis':
+            x = x.transpose(-2, -1).contiguous().view(B_, C_, self.window_size, self.window_size * 3)
+            lepe = x[:, :, :, self.window_size : 2 * self.window_size]
+        else :
+            x = x.transpose(-2, -1).contiguous().view(B_, C_, self.window_size * 3, self.window_size)
+            lepe = x[:, :, self.window_size : 2 * self.window_size, :]
+        lepe = func(lepe)
+        # print('6) lepe and x after func : ', x.shape, lepe.shape)
+
+        # y : height, x : width
+        x, lepe = map(lambda t: rearrange(t, 'b (h c) y x -> (b h) (y x) c', h = self.num_heads), (x, lepe))
+        # print('7) get_lepe output x lepe ', x.shape, lepe.shape)
+        # lepe를 reshape 해야 함.
+        return x, lepe
+
+    def Attn(self, x, flag, H, W):
+        '''
+        Input x : [3, B, HW, C/2(=c)]
+        1) q_, k_, v_ = [B, HW, c]
+        2-1) q_ : [Bhw, H/ws * W/ws, c] such as [16, 4, 2]
+        2-2) k_/v_ : [Bhw, H/ws * W/ws, c] (단, padding값도 H/ws, W/ws에 포함) such as [Bx4x4, 12(2x6), 2(chan)]
+        3) q, k, v after map(lambda t ... ) : [Bhw * head, H/ws * W/ws, c]
+        '''
+        # print('3) Attn input - ', x.shape)
+        B_, N_, C_ = x.shape[1], x.shape[2], x.shape[3]
+
+        # Implement qkv, here, divide into self.dim//2 because original input x is divided into x1/x2
+        q_, k_, v_ = x[0], x[1], x[2]
+        q_ = rearrange(q_, 'b (h w) c -> b h w c', h=H, w=W)
+        q_ = rearrange(q_, 'b (h p1) (w p2) c -> (b h w) (p1 p2) c', p1=self.window_size, p2=self.window_size)
+
+        k_ = rearrange(k_, 'b (h w) c -> b h w c', h=H, w=W).contiguous().permute(0, 3, 1, 2)
+        v_ = rearrange(v_, 'b (h w) c -> b h w c', h=H, w=W).contiguous().permute(0, 3, 1, 2)
+
+        if flag == 'x_axis':
+            # print('-----------x axis-------------')
+            k_ = F.pad(k_, (self.window_size, self.window_size, 0, 0))
+            k_ = F.unfold(k_, kernel_size = (self.window_size, self.window_size * 3), stride = self.window_size)
+            v_ = F.pad(v_, (self.window_size, self.window_size, 0, 0))
+            v_ = F.unfold(v_, kernel_size=(self.window_size, self.window_size * 3), stride=self.window_size)
+        else :
+            # print('----------y axis--------------')
+            k_ = F.pad(k_, (0, 0, self.window_size, self.window_size))
+            k_ = F.unfold(k_, kernel_size=(self.window_size * 3, self.window_size), stride=self.window_size)
+            v_ = F.pad(v_, (0, 0, self.window_size, self.window_size))
+            v_ = F.unfold(v_, kernel_size=(self.window_size * 3, self.window_size), stride=self.window_size)
+        k_ = rearrange(k_, 'b (c j) i -> (b i) j c', c=self.dim // 2)
+        v_ = rearrange(v_, 'b (c j) i -> (b i) j c', c=self.dim // 2)
+        # print('q_ k_ v_ : ', q_.shape, k_.shape, v_.shape, self.num_heads)
+
+        # Divide Embedding into Head
+        q, k = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h = self.num_heads), (q_, k_))
+        q *= self.scale
+        # print('4) q k v_ - ', q.shape, k.shape, v_.shape)
+
+        # v에 get_lepe 또는 q에 rel_pos_emb 더하기
+        v, lepe = self.get_lepe(v_, self.get_v, flag)
+
+        # Attn 구하기
+        sim = einsum('b i d, b j d -> b i j', q, k)
+
+        # ------------ Halo Attn Mask & Position Embedding Start -------- #
+        # sim += self.rel_pos_emb(q)
+        #
+        # # mask out padding (in the paper, they claim to not need masks, but what about padding?)
+        # device = x.device
+        # mask = torch.ones(1, 1, H, W, device=device)
+        # mask = F.unfold(mask, kernel_size=self.window_size * 3, stride=self.window_size, padding=self.window_size)
+        # # print('mask unfold and block halo ', mask.shape, block, halo)
+        # mask = repeat(mask, '() j i -> (b i h) () j', b=B_, h=self.num_heads)
+        # mask = mask.bool()
+        #
+        # max_neg_value = -torch.finfo(sim.dtype).max
+        #
+        # # https://thought-process-ing.tistory.com/79
+        # # sim의 바꾸고자 하는 값(mask)를 max_neg_value로 변경
+        # sim.masked_fill_(mask, max_neg_value)
+        # ------------ Halo Attn Mask & Position Embedding End----------- #
+
+        attn = sim.softmax(dim=-1)
+        out = einsum('b i j, b j d -> b i d', attn, v)
+        # print('8) qktv - ', out.shape)
+        out = out + lepe
+
+        # merge and combine heads
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=self.num_heads)
+
+        # merge blocks back to original feature map
+        out = rearrange(out, '(b h w) (p1 p2) c -> b (h p1) (w p2) c', b=B_, h=(H//self.window_size),
+                        w=(W//self.window_size), p1=self.window_size, p2=self.window_size)
+        out = out.reshape(B_, -1, C_)
+
+        # print('9) Attn output : ', out.shape)
+        # print('------------------------')
+        return out
+
+
+    def forward(self, x):
+        '''
+        input x : [B, C, H, W]
+        1) permute and view : [B, HW, C] (=[B, -1, C] 이후 norm)
+        2) qkv : [3, B, HW, C]
+        2-1) Attn input : [3, B, HW, C//2]
+        3) Attend_x : cat(x1, x2) : [B, HW, C]
+        '''
+        B_, C_, H_, W_ = x.shape
+        assert H_ >= self.window_size, 'window should be less than feature map size'
+        assert W_ >= self.window_size, 'window should be less than feature map size'
+
+        # H, W,가 window_size의 배수가 아닐 경우, 패딩
+        Padding = False
+        if min(H_, W_) < self.window_size or H_ % self.window_size != 0 or W_ % self.window_size != 0:
+            # print('padding condition : ', H_, W_, self.split_size)
+            Padding = True
+            # print(f'img_size {min(H_, W_)} is less than (or not divided by) split_size {self.split_size}, Padding.')
+            pad_r = (self.window_size - W_ % self.window_size) % self.window_size
+            pad_b = (self.window_size - H_ % self.window_size) % self.window_size
+            x = F.pad(x, (0, pad_r, 0, pad_b))
+        # print('X after padding : ', x.shape)
+
+        B, C, H, W = x.shape
+
+        x = x.permute(0, 2, 3, 1).contiguous().view(B_, H * W, C)
+        # print('1) x [B HW C] - ', x.shape)
+
+        # 우선 qkv를 만든 다음, channel을 1/2로 나눠, 하나는 가로방향, 하나는 세로방향으로 진행해야 됨.
+        img = self.norm1(x)
+        qkv = self.qkv(img).reshape(B_, H * W, 3, C).permute(2, 0, 1, 3) # [3, 1, 64, 4]
+        # print('2) qkv ', qkv.shape)
+
+        x1 = self.Attn(qkv[:, :, :, :C//2], 'x_axis', H, W)   # x-axis such as (2, 6). [3, 1, 64, 2]
+        x2 = self.Attn(qkv[:, :, :, C//2:], 'y_axis', H, W)   # y-axis such as (6, 2). [3, 1, 64, 2]
+
+        attened_x = torch.cat([x1, x2], dim=2)
+        attened_x = self.proj(attened_x)
+        x = x + self.drop_path(attened_x)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+
+        # change shape into 4 size, [batch, embed, height, width]
+        x = x.permute(0, 2, 1).contiguous()
+
+        # print('x shape after permute : ', x.shape)
+        x = x.view(-1, C, H, W)  # b c h w
+
+        # print(Padding)
+        # print(x.shape)
+        # reverse padding
+        if Padding:
+            x = x[:, :, :H_, :W_]
+
+        # print('10) Final output : ', x.shape)
+        return x
+
+class myAttnBlock(nn.Module):
+    def __init__(self, c1, c2, num_heads, window_size, num_layers=1):
+        super().__init__()
+        self.conv = None
+        if c1 != c2:
+            self.conv = Conv(c1, c2)
+        self.blocks = nn.Sequential(*[myAttention(dim=c2, num_heads=num_heads,
+                                                 window_size = window_size) for i in range(num_layers)])
+
+    def forward(self, x):
+        # print('---------------------- 1 + 2) Mine + BasicLayer ------------------------ ')
+        # print('SwinT input : ', x.shape)
+        if self.conv is not None:
+            x = self.conv(x)
+
+        x = self.blocks(x)
+        # print('MyT output: ', x.shape)
+        # print('----------------------------------------')
+        return x
+class C3Mine(C3):
+    # C3 module with CSwinTransformerBlock()
+    # c_//32 = 16
+    def __init__(self, c1, c2, num_layers=1, shortcut=True, window_size=4, g=1, e=0.5):
+        super().__init__(c1, c2, num_layers, shortcut, g, e)
+        c_ = int(c2 * e)    # 512
+        self.m = myAttnBlock(c_, c_, c_//32, window_size, num_layers)   # c1, c2, num_heads, window_size
+###################### My Own Transformer End ######################
+
+# ##################### Vanila ViT start #########################
+#
+# # classes
+# class FeedForward(nn.Module):
+#     def __init__(self, dim, hidden_dim, dropout = 0.):
+#         super().__init__()
+#         self.net = nn.Sequential(
+#             nn.LayerNorm(dim),
+#             nn.Linear(dim, hidden_dim),
+#             nn.GELU(),
+#             nn.Dropout(dropout),
+#             nn.Linear(hidden_dim, dim),
+#             nn.Dropout(dropout)
+#         )
+#
+#     def forward(self, x):
+#         return self.net(x)
+#
+# class Attention(nn.Module):
+#     def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
+#         super().__init__()
+#         inner_dim = dim_head *  heads
+#         project_out = not (heads == 1 and dim_head == dim)
+#
+#         self.heads = heads
+#         self.scale = dim_head ** -0.5
+#
+#         self.norm = nn.LayerNorm(dim)
+#
+#         self.attend = nn.Softmax(dim = -1)
+#         self.dropout = nn.Dropout(dropout)
+#
+#         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
+#
+#         self.to_out = nn.Sequential(
+#             nn.Linear(inner_dim, dim),
+#             nn.Dropout(dropout)
+#         ) if project_out else nn.Identity()
+#
+#     def forward(self, x):
+#         x = self.norm(x)
+#
+#         qkv = self.to_qkv(x).chunk(3, dim = -1)
+#         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
+#
+#         dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+#
+#         attn = self.attend(dots)
+#         attn = self.dropout(attn)
+#
+#         out = torch.matmul(attn, v)
+#         out = rearrange(out, 'b h n d -> b n (h d)')
+#         return self.to_out(out)
+#
+# class Transformer(nn.Module):
+#     def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
+#         super().__init__()
+#         self.norm = nn.LayerNorm(dim)
+#         self.layers = nn.ModuleList([])
+#         for _ in range(depth):
+#             self.layers.append(nn.ModuleList([
+#                 Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout),
+#                 FeedForward(dim, mlp_dim, dropout = dropout)
+#             ]))
+#
+#     def forward(self, x):
+#         for attn, ff in self.layers:
+#             x = attn(x) + x
+#             x = ff(x) + x
+#
+#         return self.norm(x)
+#
+# class ViT(nn.Module):
+#     def __init__(self, dim, num_heads):
+#         super().__init__()
+#
+#         self.to_patch_embedding = nn.Sequential(
+#             Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_height, p2  = patch_width),
+#             nn.LayerNorm(patch_dim),
+#             nn.Linear(patch_dim, dim),
+#             nn.LayerNorm(dim),
+#         )
+#
+#         self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+#         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+#         self.dropout = nn.Dropout(emb_dropout)
+#
+#         self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
+#
+#         self.pool = pool
+#         self.to_latent = nn.Identity()
+#
+#         self.mlp_head = nn.Linear(dim, num_classes)
+#
+#     def forward(self, img):
+#         x = self.to_patch_embedding(img)
+#         b, n, h, w = x.shape
+#
+#         x += self.pos_embedding[:, :(n + 1)]
+#         x = self.dropout(x)
+#
+#         x = self.transformer(x)
+#
+#         x = x.mean(dim = 1) if self.pool == 'mean' else x[:, 0]
+#
+#         x = self.to_latent(x)
+#         return self.mlp_head(x)
+#
+# class ViTBlock(nn.Module):
+#     '''
+#     num_heads == dim // 32 = 2/4/8/16
+#     yolov5l-tph-plus.yaml
+#         1) [B, 512, 20, 20]
+#     yolov5l-xs-tph:
+#         1) [B, 64, 160, 160]
+#         2) [B, 128, 80, 80]
+#         3) [B, 256, 40, 40]
+#         4) [B, 512, 20, 20]
+#     img_size는 forward에서 받게 한다.
+#     '''
+#     def __init__(self, c1, c2, num_heads, num_layers=1):
+#         super().__init__()
+#         self.conv = None
+#         if c1 != c2:
+#             self.conv = Conv(c1, c2)
+#
+#         # print('ViT init c1, c2, headnum, layernum, splitsize : ', c1, c2, num_heads, num_layers, split_size[0])
+#
+#         # remove input_resolution
+#         self.blocks = nn.Sequential(*[ViT(dim=c2, num_heads=num_heads) for i in range(num_layers)])
+#
+#     def forward(self, x):
+#         # print('---------------------- 1 + 2) CSWin + BasicLayer ------------------------ ')
+#         # print('SwinT input : ', x.shape)
+#         if self.conv is not None:
+#             x = self.conv(x)
+#
+#         # print('SwinT after conv : ', x.shape)
+#         x = self.blocks(x)
+#         # print('CSwinT output: ', x.shape)
+#         # print('----------------------------------------')
+#         return x
+#
+# class C3ViT(C3):
+#     # C3 module with CSwinTransformerBlock()
+#     # c_//32 = 16
+#     def __init__(self, c1, c2, num_layers=1, shortcut=True, g=1, e=0.5):
+#         super().__init__(c1, c2, num_layers, shortcut, g, e)
+#         c_ = int(c2 * e)    # 512
+#         self.m = ViTBlock(c_, c_, c_//32, num_layers)   # c1, c2, num_heads, window_size
+# ##################### Vanila ViT End ###########################
+''' mine over '''

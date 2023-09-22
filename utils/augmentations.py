@@ -14,6 +14,57 @@ from utils.general import check_version, colorstr, resample_segments, segment2bo
 from utils.metrics import bbox_ioa
 
 
+''' mine '''
+def copy_paste_augmentation(image, labels, threshold=0.6):
+    # Select a random instance from the image
+    # label what copy & paste needed : bicycle(2), van(4), truck(5), tricycle(6), awning-tricycle(7)
+    # each need 4-times, 3-times, 7-times, 4-times, 10-times
+    multiply_param = [4, 3, 7, 4, 10]
+    label_param = [2, 4, 5, 6, 7]
+
+    # multiple_val =  multiply_param[label_param.index(label)]
+
+    instance_idx = np.random.choice(len(labels))
+    instance_label = labels[instance_idx]
+
+    # Get the bounding box of the instance
+    x1, y1, x2, y2 = instance_label[2:]  # Assuming labels are in the format [class_id, x1, y1, x2, y2]
+
+    # Crop the instance from the image
+    instance = image[y1:y2, x1:x2]
+
+    # Select a random location in the image to paste the instance
+    height, width, _ = image.shape
+    paste_x = np.random.randint(0, width - (x2 - x1))
+    paste_y = np.random.randint(0, height - (y2 - y1))
+
+    # Check if the instance overlaps with any existing instances
+    for label in labels:
+        if label != instance_label:
+            overlap_x1 = max(x1, label[1])
+            overlap_y1 = max(y1, label[2])
+            overlap_x2 = min(x2, label[3])
+            overlap_y2 = min(y2, label[4])
+
+            overlap_area = max(0, overlap_x2 - overlap_x1) * max(0, overlap_y2 - overlap_y1)
+            instance_area = (x2 - x1) * (y2 - y1)
+
+            # If the overlap is more than the threshold, change the class of the overlapping instance
+            if overlap_area / instance_area > threshold:
+                label[0] = instance_label[0]
+
+    # Paste the instance into the image
+    image[paste_y:paste_y+(y2-y1), paste_x:paste_x+(x2-x1)] = instance
+
+    # Add the new instance to the labels
+    new_label = [instance_label[0], paste_x, paste_y, paste_x+(x2-x1), paste_y+(y2-y1)]
+    labels.append(new_label)
+
+    return image, labels
+''' mine is over '''
+
+
+
 class Albumentations:
     # YOLOv5 Albumentations class (optional, only used if package is installed)
     def __init__(self):
@@ -210,14 +261,28 @@ def random_perspective(im, targets=(), segments=(), degrees=10, translate=.1, sc
 
     return im, targets
 
-
+''' 레이블 수가 부족한 오브젝트에 대해 더 많은 copy paste를 진행
+1) 먼저 `p`가 0이 아닌지, 세그먼트가 있는지 확인합니다. 그렇지 않은 경우 수정 없이 입력 이미지와 레이블을 반환합니다.
+2) 세그먼트가 있고 `p`가 0이 아닌 경우 입력 이미지와 같은 크기의 빈 이미지(`im_new`)를 새로 생성합니다.
+3) 그런 다음 세그먼트의 임의의 하위 집합을 선택하고(선택할 세그먼트의 수는 `p`에 의해 결정됨), 
+   선택한 각 세그먼트에 대해 이 세그먼트를 이미지에 붙여넣으면 기존 레이블을 30% 이상 가릴 수 있는지 확인합니다. 
+   그렇지 않은 경우 새 이미지에 세그먼트를 추가하고 그에 따라 레이블을 업데이트합니다.
+4) 모든 세그먼트가 처리된 후에는 비트 단위 AND 연산을 사용하여 원본 이미지와 새 이미지를 결합합니다. 
+   이렇게 하면 복사된 세그먼트가 원본 이미지에 효과적으로 붙여넣어집니다.
+5) 마지막으로 원본 이미지의 해당 픽셀을 비트 AND 연산 결과로 대체합니다.
+ '''
 def copy_paste(im, labels, segments, p=0.5):
     # Implement Copy-Paste augmentation https://arxiv.org/abs/2012.07177, labels as nx5 np.array(cls, xyxy)
     n = len(segments)
+
+    # print('n ------ ', n, p) # 실행 안 됨.
+    # print('segnet -----')
+    # print(segments)
+
     if p and n:
         h, w, c = im.shape  # height, width, channels
         im_new = np.zeros(im.shape, np.uint8)
-        for j in random.sample(range(n), k=round(p * n)):
+        for j in random.sample(range(n), k=round(p * n)):   # sample range = 0~n / list len = round(p*n)
             l, s = labels[j], segments[j]
             box = w - l[3], l[2], w - l[1], l[4]
             ioa = bbox_ioa(box, labels[:, 1:5])  # intersection over area
@@ -236,6 +301,7 @@ def copy_paste(im, labels, segments, p=0.5):
 
 
 def cutout(im, labels, p=0.5):
+    print('cutout--------------------------')
     # Applies image cutout augmentation https://arxiv.org/abs/1708.04552
     if random.random() < p:
         h, w = im.shape[:2]
@@ -263,6 +329,7 @@ def cutout(im, labels, p=0.5):
 
 
 def mixup(im, labels, im2, labels2):
+    # print('mixup--------------------------')
     # Applies MixUp augmentation https://arxiv.org/pdf/1710.09412.pdf
     r = np.random.beta(32.0, 32.0)  # mixup ratio, alpha=beta=32.0
     im = (im * r + im2 * (1 - r)).astype(np.uint8)

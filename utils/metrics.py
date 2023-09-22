@@ -333,3 +333,53 @@ def plot_mc_curve(px, py, save_dir='mc_curve.png', names=(), xlabel='Confidence'
     plt.legend(bbox_to_anchor=(1.04, 1), loc="upper left")
     fig.savefig(Path(save_dir), dpi=250)
     plt.close()
+
+
+# ------------------------------------ Mine ------------------------------------- #
+def metrics_per_class(tp, conf, pred_cls, target_cls):
+    """
+    Compute AP75, AR1, AR10, AR100, AR500.
+    """
+
+    # Sort by objectness
+    i = np.argsort(-conf)
+    tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]
+
+    # Find unique classes
+    unique_classes = np.unique(target_cls)
+    nc = unique_classes.shape[0]  # number of classes
+
+    # Create Recall curve and compute metrics for each class
+    px = np.linspace(0, 1, 1000)  # for plotting
+    r = np.zeros((nc, 1000))
+    p = np.zeros((nc, 1000))
+    for ci, c in enumerate(unique_classes):
+        i = pred_cls == c
+        n_l = (target_cls == c).sum()  # number of labels
+        n_p = i.sum()  # number of predictions
+
+        if n_p == 0 or n_l == 0:
+            continue
+        else:
+            # Accumulate FPs and TPs
+            fpc = (1 - tp[i]).cumsum(0)
+            tpc = tp[i].cumsum(0)
+
+            # Recall
+            recall = tpc / (n_l + 1e-16)  # recall curve
+            r[ci] = np.interp(-px, -conf[i], recall[:, 0], left=0)  # negative x, xp because xp decreases
+
+            # Precision
+            precision = tpc / (tpc + fpc)  # precision curve
+            p[ci] = np.interp(-px, -conf[i], precision[:, 0], left=1)  # p at pr_score
+
+    # Compute AP75
+    AP75 = p[:, np.where(px >= 0.75)[0][0]].mean()
+
+    # Compute AR1, AR10, AR100, AR500
+    AR1 = r[:, 0].mean()
+    AR10 = r[:, 9].mean()
+    AR100 = r[:, 99].mean()
+    AR500 = r[:, 499].mean()
+
+    return AP75, AR1, AR10, AR100, AR500

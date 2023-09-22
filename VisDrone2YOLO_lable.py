@@ -2,12 +2,11 @@ import os
 import pandas as pd
 from PIL import Image
 
-YOLO_LABELS_PATH = "../datasets/VisDrone/VisDrone2019-DET-val/labels"
-VISANN_PATH = "../datasets/VisDrone/VisDrone2019-DET-val/annotations/"
-VISIMG_PATH = "../datasets//VisDrone/VisDrone2019-DET-val/images/"
+YOLO_LABELS_PATH = "/data/dataset/drone_veiw_dataset/VisDrone2019-DET-test-dev/labels"
+VISANN_PATH = "/data/dataset/drone_veiw_dataset/VisDrone2019-DET-test-dev/annotations"
+VISIMG_PATH = "/data/dataset/drone_veiw_dataset/VisDrone2019-DET-test-dev/images"
 
 def convert(bbox, img_size):
-    #将标注visDrone数据集标注转为yolov5
     #bbox top_left_x top_left_y width height
     dw = 1/(img_size[0])
     dh = 1/(img_size[1])
@@ -33,6 +32,7 @@ def ChangeToYolo5():
         for row in bbox:
             if(row[4]==1 and 0<row[5]<11):   
                 label = convert(row[:4], img_size)
+                # out_file.write(str(row[5] - 1) + " " + " ".join(str("{:.6f}".format(x)) for x in label) + '\n')
                 out_file.write(str(row[5]-1) + " " + " ".join(str(f'{x:.6f}') for x in label) + '\n')
         out_file.close()
 

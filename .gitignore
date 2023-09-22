@@ -1,0 +1,23 @@
+# .gitignore
+
+# Ignore .pth files
+*.pth
+
+# Ignore all files in a directory named models
+weights/*
+*/pth
+
+runs/*
+
+# Ignore other file types (e.g., .pyc files)
+*.pyc
+
+# Ignore directories created by virtual environments
+venv/
+.env/
+
+# Ignore Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore files created by MacOS
+.DS_Store

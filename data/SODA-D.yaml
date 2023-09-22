@@ -1,0 +1,11 @@
+path: /data/dataset/drone_veiw_dataset
+train: SODA_D/train/images  # train images (relative to 'path')  6471 images
+# train : VisDrone2019-DET-train/VisDrone2019-DET-train_super_tiny/images # train images (relative to 'path')  1000 images
+val: SODA_D/val/images  # val images (relative to 'path')  548 images
+# val : VisDrone2019-DET-val-supertiny/images
+test: SODA_D/test/images  # test images (optional)  1610 images
+
+# Classes
+nc: 10  # number of classes
+names: ['people', 'rider', 'bicycle', 'motor', 'vehicle', 'traffic-sign', 'traffic-light', 'traffic-camera',
+        'warning-cone', 'ignore']
